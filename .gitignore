@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Conda
+*.conda
+*.lock
+
+# Geospatial
+*.tif
+*.tiff
+*.vrt
+*.hdf
+*.nc
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# Outputs
+output_csvs/
+summaries/
+
+# OS
+.DS_Store
+Thumbs.db
