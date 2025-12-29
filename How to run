@@ -7,16 +7,15 @@ This card shows the exact commands needed to run the pipeline from the command l
 ## 0. Activate environment
 
 ### Conda (recommended)
-```bash
+
 conda activate mcd64a1
 
 Verify GDAL has HDF4 support:
-```bash
+
 gdalinfo --formats | grep HDF
 
 1. Go to repository root
 cd path/to/modis-fire-chronology
-
 
 (You must be in the repo root so scripts/ is found.)
 
