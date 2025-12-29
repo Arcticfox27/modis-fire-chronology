@@ -2,7 +2,10 @@
 
 Pipeline to extract MODIS MCD64A1 burned area chronology per buffer
 (multiple regions and buffer scales), and to aggregate results into
-yearly master tables suitable for further analysis.
+yearly master tables suitable for further analysis. This code was 
+used for extraction of fire history for 25 years for 22 research
+sites of DELA (Dendrochronological Laboratory of SLU Alnarp), Sweden
+across North America, Europe and Russia from 2001 to 2025.
 
 ## Structure
 
@@ -43,11 +46,6 @@ No input data or generated outputs are stored in this repository.
 
 This pipeline is actively maintained and may be updated if bugs are identified or new requirements emerge.
 
-## Run (Windows)
-
-```bat
-python scripts\extract_mcd64a1.py
-python scripts\aggregate_fire_chronology.py
 
 
 
