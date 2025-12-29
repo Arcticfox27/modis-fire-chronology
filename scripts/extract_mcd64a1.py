@@ -2,205 +2,327 @@
 # -*- coding: utf-8 -*-
 
 """
-Extract MODIS MCD64A1 Burn Date + Uncertainty into per-buffer CSVs.
+extract_mcd64a1.py
 
-Key behaviors:
-- Translates HDF subdatasets -> temporary GeoTIFF (avoids rasterio/HDF4 issues)
-- Skips tiles with no burns (no DOY in 1..366)
-- Intersects buffers with LAND-only polygon (land minus lakes)
-- Writes CSVs only when burned_pixels > 0 by default (WRITE_ZERO_CSVS=False)
-- Computes Burn_Date_Median_DOY and Uncertainty_Median per output CSV (pixel-level median within that clip)
+Extract MODIS MCD64A1 burned-area chronology per buffer (multiple regions + buffer scales).
+Writes one CSV per (tile × buffer × scale × month) only when burned_pixels > 0,
+unless --write-zero-csvs is set.
+
+Fixes vs earlier versions:
+- If --months is NOT provided: auto-detect available month folders under <hdf_root>/<year>/ as YYYY.MM.DD.
+- If multiple HDFs exist for a tile-month: select the HDF with max BurnedCells / NUMBERBURNEDPIXELS,
+  instead of "last file wins" (prevents overwriting burn months with zero-burn copies).
+- Stronger georeference checks after Translate.
 """
 
 import os
 import glob
-import tempfile
 import re
+import tempfile
 import warnings
-import math
-from dataclasses import dataclass
-from typing import Dict, Tuple, List, Optional
-
-warnings.filterwarnings("ignore", category=UserWarning)
+import argparse
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+
 from osgeo import gdal
 import rasterio
 from rasterio.mask import mask
 
 from shapely.geometry import box, Polygon, MultiPolygon, GeometryCollection
+from shapely import union_all  # shapely 2.x
 
-# ---- Shapely 2.x preferred ----
+# make_valid compat (Shapely 2 vs older)
 try:
-    from shapely import make_valid, union_all
-except Exception:  # pragma: no cover
-    make_valid = None
-    union_all = None
-
-# ---- Shapely validation fallback (for older stacks) ----
-try:
-    from shapely.validation import make_valid as make_valid_v1
-except Exception:  # pragma: no cover
-    make_valid_v1 = None
-
-
-def _make_valid(g):
-    if g is None:
-        return g
-    if make_valid is not None:
-        try:
-            return make_valid(g)
-        except Exception:
-            pass
-    if make_valid_v1 is not None:
-        try:
-            return make_valid_v1(g)
-        except Exception:
-            pass
-    # last resort
+    from shapely import make_valid  # shapely>=2
+except Exception:
     try:
-        return g.buffer(0)
+        from shapely.validation import make_valid  # shapely<2
     except Exception:
-        return g
+        def make_valid(g):
+            try:
+                return g.buffer(0)
+            except Exception:
+                return g
 
+warnings.filterwarnings("ignore", category=UserWarning)
+gdal.UseExceptions()
 
+# ---------------- Defaults (edit if you want) ----------------
+DEFAULT_YEARS = ['2001','2002','2003','2004','2005','2006','2007','2008','2009','2010']
+# Used only if you explicitly pass --months; otherwise we auto-detect folders on disk.
+DEFAULT_MONTH_SUFFIXES = ['03.01','04.01','05.01','06.01','07.01','08.01','09.01','10.01']
+
+REGION_META = {
+    'Europe': (r"A:\Project BFA\Shapefiles\buffers_per_region\buffers_Europe_3035.shp", 3035),
+    'Siberia': (r"A:\Project BFA\Shapefiles\buffers_per_region\buffers_Siberia_3576.shp", 3576),
+    'NorthAmerica': (r"A:\Project BFA\Shapefiles\buffers_per_region\buffers_NorthAmerica_5070.shp", 5070),
+}
+
+BUFFER_SCALE_FACTORS = {
+    'original': 1.00,
+    'buffer_10pct': 1.10,
+    'buffer_20pct': 1.20,
+    'buffer_50pct': 1.50,
+    'buffer_100pct': 2.00,
+}
+
+HDF_ROOT_DEFAULT = r"A:\Project BFA\hdf files"
+OUTPUT_ROOT_DEFAULT = r"A:\Project BFA\output_csvs"
+
+LAND_PATH_DEFAULT = r"A:\Project BFA\Shapefiles\Land_cover\ne_10m_land.shp"
+LAKES_PATH_DEFAULT = r"A:\Project BFA\Shapefiles\Land_cover\ne_10m_lakes.shp"
+
+# ---------------- CLI ----------------
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Extract MODIS MCD64A1 burned area metrics per buffer and write per-buffer CSVs."
+    )
+
+    p.add_argument("--years", nargs="+", default=None,
+                   help="Years to process, e.g. 2020 2021 2022. If omitted, uses defaults in script.")
+
+    # IMPORTANT: If omitted, we auto-detect folders under each year directory.
+    p.add_argument("--months", nargs="+", default=None,
+                   help="Month suffixes, e.g. 03.01 04.01 ... If omitted, auto-detect available YYYY.MM.DD folders on disk.")
+
+    p.add_argument("--regions", nargs="+", default=None,
+                   help="Regions, e.g. Europe Siberia NorthAmerica. If omitted, uses all REGION_META keys.")
+
+    p.add_argument("--hdf-root", dest="hdf_root", default=None,
+                   help="Root folder containing year/month HDF structure.")
+    p.add_argument("--out-root", dest="out_root", default=None,
+                   help="Output root where per-buffer CSVs will be written.")
+    p.add_argument("--land-path", dest="land_path", default=None,
+                   help="Natural Earth land shapefile path.")
+    p.add_argument("--lakes-path", dest="lakes_path", default=None,
+                   help="Natural Earth lakes shapefile path.")
+
+    p.add_argument("--write-zero-csvs", action="store_true",
+                   help="If set, write zero-burn CSVs too (default: off).")
+    p.add_argument("--overwrite", action="store_true",
+                   help="If set, overwrite existing CSVs (default: skip existing).")
+
+    p.add_argument("--tile-buffer-m", type=int, default=15000,
+                   help="Buffer (meters) around tile bbox used to clip land mask. Default 15000.")
+    p.add_argument("--grid-size", type=float, default=100.0,
+                   help="grid_size used in shapely.union_all for stabilizing unions. Default 100.0.")
+    p.add_argument("--simplify-m", type=float, default=50.0,
+                   help="Simplify tolerance (meters) for land union polygon; 0 disables. Default 50.")
+
+    return p.parse_args()
+
+# ---------------- Geometry helpers ----------------
 def _polygon_only(geom):
-    """Keep only Polygon/MultiPolygon parts; drop lines/points/collections."""
     if geom is None or geom.is_empty:
         return None
     t = geom.geom_type
     if t in ("Polygon", "MultiPolygon"):
         return geom
     if isinstance(geom, GeometryCollection) and hasattr(geom, "geoms"):
-        polys = [g for g in geom.geoms if g.geom_type in ("Polygon",)]
-        if polys:
-            return MultiPolygon(polys) if len(polys) > 1 else polys[0]
+        parts = []
+        for g in geom.geoms:
+            if g is None or g.is_empty:
+                continue
+            if g.geom_type == "Polygon":
+                parts.append(g)
+            elif g.geom_type == "MultiPolygon":
+                parts.extend(list(g.geoms))
+        if not parts:
+            return None
+        return MultiPolygon(parts) if len(parts) > 1 else parts[0]
     return None
 
+def _clean_series_to_polys(gser):
+    gser = gser.dropna().apply(make_valid).apply(_polygon_only)
+    gser = gpd.GeoSeries([g for g in gser if g is not None], crs=gser.crs)
+    if len(gser) == 0:
+        return gser
+    gser = gser.buffer(0)
+    gser = gser[~gser.is_empty]
+    return gser
 
-def _clean_series_to_polys(gser: gpd.GeoSeries) -> gpd.GeoSeries:
-    """Valid -> polygon-only -> buffer(0) -> drop empties."""
-    if gser is None or len(gser) == 0:
-        return gpd.GeoSeries([], crs=getattr(gser, "crs", None))
-
-    gser = gser.dropna().apply(_make_valid).apply(_polygon_only)
-    geoms = [g for g in gser if g is not None and (not g.is_empty)]
-    out = gpd.GeoSeries(geoms, crs=gser.crs)
-    if len(out) == 0:
-        return out
-    try:
-        out = out.buffer(0)
-        out = out[~out.is_empty]
-    except Exception:
-        pass
-    return out
-
-
-def _bbox_filter(gdf: gpd.GeoDataFrame, clip_poly) -> gpd.GeoDataFrame:
-    """Fast bbox filter using spatial index; then intersects."""
+def _bbox_filter(gdf, clip_poly):
     if gdf.empty:
         return gdf
-    try:
-        sidx = gdf.sindex
-    except Exception:
-        sidx = None
-
-    if sidx is None:
+    if not hasattr(gdf, "sindex") or gdf.sindex is None:
         return gdf[gdf.intersects(clip_poly)]
-
-    hits = list(sidx.intersection(clip_poly.bounds))
+    hits = list(gdf.sindex.intersection(clip_poly.bounds))
     if not hits:
         return gdf.iloc[[]]
     cand = gdf.iloc[hits]
     return cand[cand.intersects(clip_poly)]
 
-
 _land_union_cache = {}
 
-
-def land_union_in_crs_clipped(land_path: str, lakes_path: str, target_crs, clip_poly, grid_size: float = 100.0):
-    """
-    Build land-only union (land minus lakes) in target CRS, clipped to clip_poly.
-    Cached by (CRS, clip bounds, grid_size).
-    """
+def land_union_in_crs_clipped(land_path, lakes_path, target_crs, clip_poly, grid_size=100.0):
     extent_key = tuple(np.round(gpd.GeoSeries([clip_poly], crs=target_crs).total_bounds, 1))
     key = (str(target_crs), extent_key, float(grid_size))
     if key in _land_union_cache:
         return _land_union_cache[key]
 
-    land = gpd.read_file(land_path).to_crs(target_crs)
+    land  = gpd.read_file(land_path).to_crs(target_crs)
     lakes = gpd.read_file(lakes_path).to_crs(target_crs)
 
-    land = _bbox_filter(land, clip_poly)
+    land  = _bbox_filter(land, clip_poly)
     lakes = _bbox_filter(lakes, clip_poly)
 
     if not land.empty:
+        land = land.copy()
         land["geometry"] = land.geometry.intersection(clip_poly)
         land = land[~land.is_empty]
+
     if not lakes.empty:
+        lakes = lakes.copy()
         lakes["geometry"] = lakes.geometry.intersection(clip_poly)
         lakes = lakes[~lakes.is_empty]
 
-    land_polys = _clean_series_to_polys(land.geometry) if not land.empty else gpd.GeoSeries([], crs=target_crs)
+    land_polys  = _clean_series_to_polys(land.geometry)  if not land.empty  else gpd.GeoSeries([], crs=target_crs)
     lakes_polys = _clean_series_to_polys(lakes.geometry) if not lakes.empty else gpd.GeoSeries([], crs=target_crs)
 
-    if union_all is None:
-        # fallback for very old shapely (less ideal)
-        land_u = land_polys.unary_union if len(land_polys) else MultiPolygon()
-        lakes_u = lakes_polys.unary_union if len(lakes_polys) else MultiPolygon()
-    else:
-        land_u = union_all(list(land_polys), grid_size=grid_size) if len(land_polys) else MultiPolygon()
-        lakes_u = union_all(list(lakes_polys), grid_size=grid_size) if len(lakes_polys) else MultiPolygon()
+    land_u  = union_all(list(land_polys),  grid_size=grid_size) if len(land_polys)  else MultiPolygon()
+    lakes_u = union_all(list(lakes_polys), grid_size=grid_size) if len(lakes_polys) else MultiPolygon()
 
-    land_only = _make_valid(land_u).difference(_make_valid(lakes_u))
-    land_only = _polygon_only(_make_valid(land_only)) or MultiPolygon()
+    land_only = make_valid(land_u).difference(make_valid(lakes_u))
+    land_only = _polygon_only(make_valid(land_only)) or MultiPolygon()
     if isinstance(land_only, Polygon):
         land_only = MultiPolygon([land_only])
 
     _land_union_cache[key] = land_only
     return land_only
 
+# ---------------- MODIS SDS selection + translation ----------------
+def _pick_subdatasets(ds):
+    subs = ds.GetSubDatasets() or []
+    burn_sds = None
+    unc_sds = None
 
-def _select_subdataset(subdatasets, want_lower: str) -> Optional[str]:
-    """Return subdataset name matching key in description or name."""
-    for name, desc in subdatasets:
-        if want_lower in (desc or "").lower() or want_lower in (name or "").lower():
-            return name
-    return None
+    burn_keys = ("burn date", "burn_date")
+    unc_keys = ("burn date uncertainty", "uncertainty", "burn_date_uncertainty")
 
+    for name, desc in subs:
+        s = (name + " " + desc).lower()
+        if burn_sds is None and any(k in s for k in burn_keys):
+            burn_sds = name
+        if unc_sds is None and any(k in s for k in unc_keys):
+            unc_sds = name
 
-@dataclass
-class ExtractConfig:
-    years: List[str]
-    month_suffixes: List[str]
-    region_meta: Dict[str, Tuple[str, int]]
-    buffer_scale_factors: Dict[str, float]
+    return burn_sds, unc_sds
 
-    hdf_root: str
-    output_root: str
+def translate_sds_to_tif_with_geo(sds_name: str, out_tif: str) -> bool:
+    src = gdal.Open(sds_name)
+    if src is None:
+        return False
 
-    land_path: str
-    lakes_path: str
+    proj = src.GetProjection()
+    gt   = src.GetGeoTransform(can_return_null=True)
 
-    write_zero_csvs: bool = False
-    tile_buffer_m: float = 15000.0
-    land_union_grid_size: float = 100.0
-    land_union_simplify_m: float = 50.0
+    out = gdal.Translate(out_tif, src, format="GTiff")
+    if out is None:
+        return False
+    out = None
 
+    ds_out = gdal.Open(out_tif, gdal.GA_Update)
+    if ds_out is None:
+        return False
 
-def run_extraction(cfg: ExtractConfig) -> List[str]:
-    all_written = []
+    if (not ds_out.GetProjection()) and proj:
+        ds_out.SetProjection(proj)
+    if (ds_out.GetGeoTransform(can_return_null=True) is None) and (gt is not None):
+        ds_out.SetGeoTransform(gt)
 
-    for year in cfg.years:
+    ds_out = None
+    return True
+
+# ---------------- Month auto-detection ----------------
+_month_folder_re = re.compile(r"^(?P<year>\d{4})\.(?P<mm>\d{2})\.(?P<dd>\d{2})$")
+
+def detect_month_suffixes_for_year(hdf_root: str, year: str):
+    """
+    Look inside <hdf_root>/<year>/ for folders named YYYY.MM.DD and return suffixes MM.DD sorted.
+    """
+    year_dir = os.path.join(hdf_root, str(year))
+    if not os.path.isdir(year_dir):
+        return []
+
+    suffixes = []
+    for name in os.listdir(year_dir):
+        m = _month_folder_re.match(name)
+        if not m:
+            continue
+        if m.group("year") != str(year):
+            continue
+        suffixes.append(f"{m.group('mm')}.{m.group('dd')}")
+
+    # sort by month then day
+    suffixes = sorted(set(suffixes), key=lambda s: (int(s.split(".")[0]), int(s.split(".")[1])))
+    return suffixes
+
+# ---------------- Prefer HDF with burns (handles duplicates) ----------------
+def burn_count_from_hdf(hdf_path: str) -> int:
+    """
+    Read BurnedCells / NUMBERBURNEDPIXELS from HDF metadata; fallback 0 on any error.
+    """
+    try:
+        ds = gdal.Open(hdf_path)
+        if ds is None:
+            return 0
+        md = ds.GetMetadata() or {}
+        # MCD64A1 commonly has BurnedCells and NUMBERBURNEDPIXELS
+        for k in ("BurnedCells", "NUMBERBURNEDPIXELS"):
+            if k in md:
+                try:
+                    return int(str(md[k]).strip())
+                except Exception:
+                    pass
+        return 0
+    except Exception:
+        return 0
+
+# ---------------- Core extraction ----------------
+def run_extraction(
+    run_years,
+    run_months,          # can be None => auto detect per year
+    run_regions,
+    hdf_root,
+    out_root,
+    land_path,
+    lakes_path,
+    buffer_scale_factors,
+    write_zero_csvs=False,
+    overwrite=False,
+    tile_buffer_m=15000,
+    grid_size=100.0,
+    simplify_m=50.0,
+):
+    all_written_csvs = []
+
+    region_meta_run = {k: REGION_META[k] for k in run_regions if k in REGION_META}
+    if not region_meta_run:
+        raise ValueError(f"No valid regions selected. Requested={run_regions}, available={list(REGION_META.keys())}")
+
+    tile_re = re.compile(r"(h\d{2}v\d{2})", re.IGNORECASE)
+
+    for year in run_years:
+        year = str(year)
         print(f"\n====== Processing Year: {year} ======")
 
-        for month_suffix in cfg.month_suffixes:
-            month_int = int(month_suffix.split(".")[0])  # '03.01' -> 3
+        # AUTO-DETECT months if not provided
+        if run_months is None:
+            months_this_year = detect_month_suffixes_for_year(hdf_root, year)
+            if not months_this_year:
+                print(f"WARNING: no month folders detected under {os.path.join(hdf_root, year)}")
+            else:
+                print(f"Detected months for {year}: {', '.join(months_this_year)}")
+        else:
+            months_this_year = [str(m) for m in run_months]
+
+        for month_suffix in months_this_year:
+            month_int = int(month_suffix.split('.')[0])  # '03.01' -> 3
 
             month_folder_name = f"{year}.{month_suffix}"
-            month_folder = os.path.join(cfg.hdf_root, year, month_folder_name)
+            month_folder = os.path.join(hdf_root, year, month_folder_name)
             print(f"\n----- Processing Month Folder: {month_folder_name} -----")
 
             if not os.path.isdir(month_folder):
@@ -212,9 +334,8 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
                 print(f"No HDF files in {month_folder}")
                 continue
 
-            # group by tile id hXXvYY
+            # Group by tile id (hXXvYY)
             tile_dict = {}
-            tile_re = re.compile(r"(h\d{2}v\d{2})", re.IGNORECASE)
             for hdf in hdfs:
                 m = tile_re.search(os.path.basename(hdf))
                 if m:
@@ -225,74 +346,84 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
                 print(f"\n--- Tile {tile} ({year}-{month_suffix}) ---")
 
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    tif_burn_date = os.path.join(tmpdir, f"{tile}_burndate.tif")
+                    tif_burn_date   = os.path.join(tmpdir, f"{tile}_burndate.tif")
                     tif_uncertainty = os.path.join(tmpdir, f"{tile}_uncertainty.tif")
 
-                    # Translate subdatasets -> GTiff (last wins)
-                    wrote_any = False
-                    for hdf in tile_files:
-                        ds = gdal.Open(hdf)
-                        if ds is None:
-                            continue
-                        subdatasets = ds.GetSubDatasets()
+                    # If duplicates exist, pick the one with max burn count (prevents "zero overwrites burn")
+                    tile_files_sorted = sorted(tile_files)
+                    best_hdf = max(tile_files_sorted, key=burn_count_from_hdf)
 
-                        burn_sds = _select_subdataset(subdatasets, "burn date")
-                        unc_sds = _select_subdataset(subdatasets, "uncertainty")
-
+                    try:
+                        ds = gdal.Open(best_hdf)
+                        burn_sds, unc_sds = _pick_subdatasets(ds)
                         if burn_sds is None or unc_sds is None:
-                            print(f"  Skipping (missing subdatasets): {os.path.basename(hdf)}")
+                            print(f"  Skipping (missing subdatasets): {os.path.basename(best_hdf)}")
                             continue
 
-                        gdal.Translate(tif_burn_date, burn_sds, format="GTiff")
-                        gdal.Translate(tif_uncertainty, unc_sds, format="GTiff")
-                        wrote_any = True
+                        ok1 = translate_sds_to_tif_with_geo(burn_sds, tif_burn_date)
+                        ok2 = translate_sds_to_tif_with_geo(unc_sds, tif_uncertainty)
+                        if not (ok1 and ok2):
+                            print("  → Translate failed → skipping tile.")
+                            continue
 
-                    if not wrote_any or (not os.path.isfile(tif_burn_date)):
-                        print("  → No readable burn-date output for this tile → skipping.")
+                    except Exception as e:
+                        print(f"  Skipping (GDAL read/translate error): {os.path.basename(best_hdf)} → {e}")
                         continue
 
-                    # raster info + fast skip
-                    with rasterio.open(tif_burn_date) as src_bd:
-                        raster_crs = src_bd.crs
-                        tile_bounds = src_bd.bounds
-                        px_x, px_y = src_bd.res
+                    if (not os.path.isfile(tif_burn_date)) or (not os.path.isfile(tif_uncertainty)):
+                        print("  → No valid GeoTIFFs produced for this tile-month → skipping tile.")
+                        continue
+
+                    # raster info & pixel area (+ fast skip)
+                    with rasterio.open(tif_burn_date) as src_burn_date:
+                        if src_burn_date.crs is None:
+                            print("  ERROR: GeoTIFF has no CRS after translation → skipping tile.")
+                            continue
+
+                        b = src_burn_date.bounds
+                        if abs(b.right - b.left) < 1000 and abs(b.top - b.bottom) < 1000:
+                            print(f"  ERROR: Suspicious bounds {b} (pixel coords?) → skipping tile.")
+                            continue
+
+                        raster_crs  = src_burn_date.crs
+                        tile_bounds = src_burn_date.bounds
+                        px_x, px_y  = src_burn_date.res
                         pixel_area_km2 = abs(px_x * px_y) / 1e6
 
-                        arr = src_bd.read(1, masked=True)
+                        arr = src_burn_date.read(1, masked=True)
                         if not np.any((arr >= 1) & (arr <= 366)):
                             print(f"  → Tile {tile} has no burns this month → skipping buffers.")
                             continue
 
+                    # Build land union clipped to tile bbox (+tile_buffer_m)
                     tile_poly = box(tile_bounds.left, tile_bounds.bottom, tile_bounds.right, tile_bounds.top)
-                    clip_poly = gpd.GeoSeries([tile_poly], crs=raster_crs).buffer(cfg.tile_buffer_m).iloc[0]
+                    clip_poly = gpd.GeoSeries([tile_poly], crs=raster_crs).buffer(tile_buffer_m).iloc[0]
 
                     land_union_raster = land_union_in_crs_clipped(
-                        cfg.land_path, cfg.lakes_path, raster_crs, clip_poly,
-                        grid_size=cfg.land_union_grid_size
+                        land_path, lakes_path, raster_crs, clip_poly, grid_size=grid_size
                     )
-                    try:
-                        land_union_raster = land_union_raster.simplify(cfg.land_union_simplify_m)
-                    except Exception:
-                        pass
+                    if simplify_m and simplify_m > 0:
+                        try:
+                            land_union_raster = land_union_raster.simplify(float(simplify_m))
+                        except Exception:
+                            pass
 
                     saved_count = 0
                     zero_count = 0
+                    skipped_existing = 0
 
-                    for region, (buffer_path, equal_area_epsg) in cfg.region_meta.items():
+                    for region, (buffer_path, equal_area_epsg) in region_meta_run.items():
                         print(f"Region: {region}")
 
                         buffer_gdf = gpd.read_file(buffer_path)
-                        if buffer_gdf.crs is None:
-                            buffer_gdf = buffer_gdf.set_crs(equal_area_epsg)
-                        else:
-                            buffer_gdf = buffer_gdf.to_crs(equal_area_epsg)
+                        buffer_gdf = buffer_gdf.to_crs(equal_area_epsg) if buffer_gdf.crs else buffer_gdf.set_crs(equal_area_epsg)
 
                         if "Buffer_km2" not in buffer_gdf.columns:
                             raise ValueError(f"'Buffer_km2' missing in {buffer_path}")
 
                         buffer_gdf["buffer_radius_m"] = np.sqrt(buffer_gdf["Buffer_km2"] * 1e6 / np.pi)
 
-                        for scale_name, mfac in cfg.buffer_scale_factors.items():
+                        for scale_name, mfac in buffer_scale_factors.items():
                             grow_dist = buffer_gdf["buffer_radius_m"] * (mfac - 1.0)
                             buffer_gdf_scaled = buffer_gdf.copy()
                             buffer_gdf_scaled["geometry"] = buffer_gdf.geometry.buffer(grow_dist)
@@ -304,8 +435,8 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
                             print(f"  → {len(intersecting)} buffers intersect this tile in raster CRS.")
 
                             for idx, row in intersecting.iterrows():
-                                geom_landonly = _make_valid(row.geometry).intersection(_make_valid(land_union_raster))
-                                geom_landonly = _polygon_only(_make_valid(geom_landonly))
+                                geom_landonly = make_valid(row.geometry).intersection(land_union_raster)
+                                geom_landonly = _polygon_only(make_valid(geom_landonly))
                                 if geom_landonly is None or geom_landonly.is_empty:
                                     continue
 
@@ -313,13 +444,15 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
 
                                 buffer_area_class = f"A{int(row['Buffer_km2'])}"
                                 output_dir = os.path.join(
-                                    cfg.output_root, year, month_folder_name, region, buffer_area_class, scale_name
+                                    out_root, year, month_folder_name, region, buffer_area_class, scale_name
                                 )
                                 os.makedirs(output_dir, exist_ok=True)
 
                                 out_csv = os.path.join(output_dir, f"{tile}_Buffer{idx}_{year}_{month_suffix}.csv")
+                                if (not overwrite) and os.path.isfile(out_csv):
+                                    skipped_existing += 1
+                                    continue
 
-                                # Clip burn date first
                                 try:
                                     with rasterio.open(tif_burn_date) as src_burn:
                                         burn_date_clip, _ = mask(src_burn, mask_shapes, crop=True)
@@ -328,14 +461,17 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
 
                                 bd = burn_date_clip[0]
                                 valid = (bd >= 1) & (bd <= 366)
+
                                 burned_pixels = int(valid.sum())
+                                burned_area_km2 = burned_pixels * pixel_area_km2
+                                areaid_val = str(row["AreaID"]) if "AreaID" in row else f"Buffer{idx}"
 
                                 if burned_pixels == 0:
                                     zero_count += 1
-                                    if cfg.write_zero_csvs:
+                                    if write_zero_csvs:
                                         pd.DataFrame([{
                                             "Region": region,
-                                            "AreaID": str(row["AreaID"]) if "AreaID" in row else f"Buffer{idx}",
+                                            "AreaID": areaid_val,
                                             "Buffer_Size": float(row["Buffer_km2"]),
                                             "Buffer_Scale": scale_name,
                                             "Year": int(year),
@@ -350,23 +486,19 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
                                             "Uncertainty_Max": None,
                                             "Uncertainty_Median": None,
                                         }]).to_csv(out_csv, index=False)
-
-                                        print(f"    wrote CSV (zero): {out_csv}")
-                                        all_written.append(out_csv)
+                                        all_written_csvs.append(out_csv)
                                     continue
 
-                                burned_area_km2 = burned_pixels * pixel_area_km2
-
-                                # Clip uncertainty only if burns exist
                                 try:
                                     with rasterio.open(tif_uncertainty) as src_unc:
                                         uncertainty_clip, _ = mask(src_unc, mask_shapes, crop=True)
                                 except ValueError:
-                                    bd_vals = bd[valid]
+                                    bd_vals = bd[valid].astype("float64", copy=False)
                                     burn_date_median_doy = float(np.nanmedian(bd_vals)) if bd_vals.size else None
+
                                     pd.DataFrame([{
                                         "Region": region,
-                                        "AreaID": str(row["AreaID"]) if "AreaID" in row else f"Buffer{idx}",
+                                        "AreaID": areaid_val,
                                         "Buffer_Size": float(row["Buffer_km2"]),
                                         "Buffer_Scale": scale_name,
                                         "Year": int(year),
@@ -382,20 +514,19 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
                                         "Uncertainty_Median": None,
                                     }]).to_csv(out_csv, index=False)
 
-                                    print(f"    wrote CSV: {out_csv}  (burned_pixels={burned_pixels}, no-uncertainty)")
-                                    all_written.append(out_csv)
+                                    all_written_csvs.append(out_csv)
                                     saved_count += 1
                                     continue
 
-                                bd_vals = bd[valid]
-                                un_vals = uncertainty_clip[0][valid]
+                                bd_vals = bd[valid].astype("float64", copy=False)
+                                un_vals = uncertainty_clip[0][valid].astype("float64", copy=False)
 
                                 burn_date_median_doy = float(np.nanmedian(bd_vals)) if bd_vals.size else None
                                 uncertainty_median = float(np.nanmedian(un_vals)) if un_vals.size else None
 
                                 pd.DataFrame([{
                                     "Region": region,
-                                    "AreaID": str(row["AreaID"]) if "AreaID" in row else f"Buffer{idx}",
+                                    "AreaID": areaid_val,
                                     "Buffer_Size": float(row["Buffer_km2"]),
                                     "Buffer_Scale": scale_name,
                                     "Year": int(year),
@@ -411,53 +542,57 @@ def run_extraction(cfg: ExtractConfig) -> List[str]:
                                     "Uncertainty_Median": uncertainty_median,
                                 }]).to_csv(out_csv, index=False)
 
-                                print(f"    wrote CSV: {out_csv}  (burned_pixels={burned_pixels})")
-                                all_written.append(out_csv)
+                                all_written_csvs.append(out_csv)
                                 saved_count += 1
 
-                    print(f"--- Tile {tile} done: {saved_count} CSVs with burns, {zero_count} zero-burn buffers ---")
+                    print(f"--- Tile {tile} done: {saved_count} CSVs with burns, "
+                          f"{zero_count} zero-burn cases, {skipped_existing} skipped-existing ---")
 
     print("\n================ SUMMARY ================")
-    print(f"Total CSVs written: {len(all_written)}")
-    if all_written:
-        preview = min(15, len(all_written))
+    print(f"Total CSVs written: {len(all_written_csvs)}")
+    if all_written_csvs:
+        preview = min(15, len(all_written_csvs))
         print(f"First {preview} CSV paths:")
-        for p in all_written[:preview]:
+        for p in all_written_csvs[:preview]:
             print("  →", p)
     else:
         print("No CSVs were written.")
-    print("========================================\nAll done.")
+    print("========================================\nAll done.\n")
 
-    return all_written
-
+    return all_written_csvs
 
 def main():
-    # ---- EDIT DEFAULTS HERE (or later replace with argparse/config file) ----
-    cfg = ExtractConfig(
-        years=["2020"],
-        month_suffixes=["03.01", "04.01", "05.01", "06.01", "07.01", "08.01", "09.01", "10.01"],
-        region_meta={
-            "Europe": (r"A:\Project BFA\Shapefiles\buffers_per_region\buffers_Europe_3035.shp", 3035),
-            "Siberia": (r"A:\Project BFA\Shapefiles\buffers_per_region\buffers_Siberia_3576.shp", 3576),
-            "NorthAmerica": (r"A:\Project BFA\Shapefiles\buffers_per_region\buffers_NorthAmerica_5070.shp", 5070),
-        },
-        buffer_scale_factors={
-            "original": 1.00,
-            "buffer_10pct": 1.10,
-            "buffer_20pct": 1.20,
-            "buffer_50pct": 1.50,
-            "buffer_100pct": 2.00,
-        },
-        hdf_root=r"A:\Project BFA\hdf files",
-        output_root=r"A:\Project BFA\output_csvs",
-        land_path=r"A:\Project BFA\Shapefiles\Land_cover\ne_10m_land.shp",
-        lakes_path=r"A:\Project BFA\Shapefiles\Land_cover\ne_10m_lakes.shp",
-        write_zero_csvs=False,  # IMPORTANT: default = don't write zero-burn CSVs
+    args = parse_args()
+
+    run_years = args.years if args.years is not None else DEFAULT_YEARS
+
+    # If user doesn't pass --months, we AUTO-DETECT months per year
+    run_months = None if args.months is None else args.months
+
+    run_regions = args.regions if args.regions is not None else list(REGION_META.keys())
+
+    hdf_root = args.hdf_root if args.hdf_root is not None else HDF_ROOT_DEFAULT
+    out_root = args.out_root if args.out_root is not None else OUTPUT_ROOT_DEFAULT
+    land_p = args.land_path if args.land_path is not None else LAND_PATH_DEFAULT
+    lakes_p = args.lakes_path if args.lakes_path is not None else LAKES_PATH_DEFAULT
+
+    os.makedirs(out_root, exist_ok=True)
+
+    run_extraction(
+        run_years=run_years,
+        run_months=run_months,
+        run_regions=run_regions,
+        hdf_root=hdf_root,
+        out_root=out_root,
+        land_path=land_p,
+        lakes_path=lakes_p,
+        buffer_scale_factors=BUFFER_SCALE_FACTORS,
+        write_zero_csvs=bool(args.write_zero_csvs),
+        overwrite=bool(args.overwrite),
+        tile_buffer_m=int(args.tile_buffer_m),
+        grid_size=float(args.grid_size),
+        simplify_m=float(args.simplify_m),
     )
-
-    os.makedirs(cfg.output_root, exist_ok=True)
-    run_extraction(cfg)
-
 
 if __name__ == "__main__":
     main()
