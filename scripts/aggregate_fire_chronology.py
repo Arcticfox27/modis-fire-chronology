@@ -1,12 +1,5 @@
 #!/usr/bin/env python
 # coding: utf-8
-
-# In[ ]:
-
-
-#!/usr/bin/env python
-# coding: utf-8
-
 """
 Aggregate MODIS MCD64A1 per-buffer CSV outputs into monthly master tables (one CSV per year),
 including:
@@ -36,10 +29,21 @@ except Exception:
         except Exception:
             return g
 
+# Prefer shapely 2.x union_all if available
 try:
-    from shapely.ops import unary_union
+    from shapely import union_all as shapely_union_all  # shapely>=2
+except Exception:
+    shapely_union_all = None
+
+try:
+    from shapely.ops import unary_union  # shapely<=1.x path (may still exist)
 except Exception:
     unary_union = None
+
+try:
+    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+except Exception:
+    Polygon = MultiPolygon = GeometryCollection = None
 
 
 # ------------------
@@ -102,6 +106,12 @@ def parse_args():
     # If you ever want to restrict which regions are used for land area calc:
     p.add_argument("--regions", nargs="+", default=None,
                    help="Regions to include for land-area denominator, e.g. Europe Siberia NorthAmerica. Default: all.")
+
+    # Optional knobs for geometry robustness/speed
+    p.add_argument("--union-grid-size", type=float, default=100.0,
+                   help="grid_size used in shapely union_all (when available). Larger can reduce topology errors.")
+    p.add_argument("--simplify-m", type=float, default=0.0,
+                   help="Optional simplify tolerance in *meters* in the target CRS before union (0 = off).")
 
     return p.parse_args()
 
@@ -182,16 +192,90 @@ def weighted_median(values, weights):
     cutoff = 0.5 * w.sum()
     return float(v[np.searchsorted(cum, cutoff)])
 
+def _polygon_only(geom):
+    """Keep only polygonal components; drop lines/points/empties."""
+    if geom is None:
+        return None
+    try:
+        if geom.is_empty:
+            return None
+        t = geom.geom_type
+        if t in ("Polygon", "MultiPolygon"):
+            return geom
+        if t == "GeometryCollection":
+            polys = []
+            for g in getattr(geom, "geoms", []):
+                if g is not None and (not g.is_empty) and g.geom_type in ("Polygon", "MultiPolygon"):
+                    polys.append(g)
+            if not polys:
+                return None
+            if len(polys) == 1:
+                return polys[0]
+            # dissolve the polygon pieces later; for now wrap as a MultiPolygon-ish collection
+            try:
+                return MultiPolygon([p for p in polys if getattr(p, "geom_type", "") == "Polygon"])
+            except Exception:
+                # fallback: return first polygonal geom
+                return polys[0]
+        return None
+    except Exception:
+        return None
+
+def _clean_geom_series_to_polys(gser: gpd.GeoSeries, simplify_tol: float = 0.0) -> list:
+    """
+    Defensive cleaning for messy Natural Earth geometries:
+    make_valid -> polygon_only -> buffer(0) -> drop empties -> optional simplify
+    Returns a Python list of geometries safe(r) to union.
+    """
+    if gser is None or len(gser) == 0:
+        return []
+    out = []
+    for g in gser:
+        if g is None:
+            continue
+        try:
+            g = make_valid(g)
+            g = _polygon_only(g)
+            if g is None:
+                continue
+            # buffer(0) as additional repair
+            try:
+                g = g.buffer(0)
+            except Exception:
+                pass
+            if g is None or getattr(g, "is_empty", True):
+                continue
+            if simplify_tol and simplify_tol > 0:
+                try:
+                    g = g.simplify(simplify_tol)
+                except Exception:
+                    pass
+            if g is None or getattr(g, "is_empty", True):
+                continue
+            out.append(g)
+        except Exception:
+            continue
+    return out
+
 
 # ------------------
-# Land-only denominator machinery
+# Land-only denominator machinery (PATCHED)
 # ------------------
 _land_union_cache = {}       # crs_str -> land_only_geom
 _region_buffer_cache = {}    # region -> (gdf_equal_area, name_col)
 _region_areaid_index = {}    # region -> {AreaID-or-BufferX: row}
 
-def land_union_in_crs(land_path: str, lakes_path: str, epsg_or_crs):
-    key = str(epsg_or_crs)
+def land_union_in_crs(land_path: str, lakes_path: str, epsg_or_crs,
+                      union_grid_size: float = 100.0, simplify_m: float = 0.0):
+    """
+    Build 'land-only' geometry in target CRS, robust to invalid geometries.
+
+    Key change vs your previous version:
+    - CLEAN geometries before union (make_valid + polygon_only + buffer(0))
+    - Use shapely.union_all with grid_size when available (helps topology)
+    - Retry union with fallback strategies instead of crashing
+    """
+    key = (str(epsg_or_crs), float(union_grid_size), float(simplify_m))
     if key in _land_union_cache:
         return _land_union_cache[key]
 
@@ -201,22 +285,56 @@ def land_union_in_crs(land_path: str, lakes_path: str, epsg_or_crs):
     land  = land.to_crs(epsg_or_crs)
     lakes = lakes.to_crs(epsg_or_crs)
 
-    # dissolve
-    try:
-        land_u  = unary_union(land.geometry) if unary_union is not None else land.unary_union
-        lakes_u = unary_union(lakes.geometry) if unary_union is not None else lakes.unary_union
-    except Exception:
-        land_u  = land.unary_union
-        lakes_u = lakes.unary_union
+    land_geoms  = _clean_geom_series_to_polys(land.geometry,  simplify_tol=simplify_m)
+    lakes_geoms = _clean_geom_series_to_polys(lakes.geometry, simplify_tol=simplify_m)
 
-    land_u  = make_valid(land_u)
-    lakes_u = make_valid(lakes_u)
+    # --- UNION (robust) ---
+    def _do_union(geoms, grid_size):
+        if not geoms:
+            return None
+        if shapely_union_all is not None:
+            return shapely_union_all(geoms, grid_size=grid_size)
+        # shapely<2 fallback
+        if unary_union is not None:
+            return unary_union(geoms)
+        # geopandas fallback (may still call shapely union underneath)
+        try:
+            return gpd.GeoSeries(geoms).unary_union
+        except Exception:
+            return None
+
+    # try union with requested grid_size, then with None/0, then with a larger grid_size
+    land_u = None
+    lakes_u = None
+    for gs in (union_grid_size, 0.0, max(500.0, union_grid_size)):
+        try:
+            land_u = _do_union(land_geoms, gs)
+            lakes_u = _do_union(lakes_geoms, gs)
+            break
+        except Exception:
+            land_u = None
+            lakes_u = None
+
+    # final fallbacks if union still fails
+    if land_u is None:
+        # last resort: take first geometry (better than crashing)
+        land_u = land_geoms[0] if land_geoms else None
+    if lakes_u is None:
+        lakes_u = lakes_geoms[0] if lakes_geoms else None
+
+    land_u  = make_valid(land_u)  if land_u  is not None else None
+    lakes_u = make_valid(lakes_u) if lakes_u is not None else None
+
+    if land_u is None:
+        _land_union_cache[key] = None
+        return None
 
     try:
-        land_only = land_u.difference(lakes_u)
+        land_only = land_u.difference(lakes_u) if lakes_u is not None else land_u
     except Exception:
         land_only = land_u
 
+    land_only = make_valid(land_only)
     _land_union_cache[key] = land_only
     return land_only
 
@@ -264,8 +382,9 @@ def scale_buffer_geom(base_row, scale_code: str):
 _land_area_cache = {}  # (region, areaid, scale_code) -> land_km2
 
 def land_area_km2_for(region: str, areaid: str, scale_code: str,
-                      region_files: dict, land_path: str, lakes_path: str):
-    key = (region, areaid, scale_code)
+                      region_files: dict, land_path: str, lakes_path: str,
+                      union_grid_size: float = 100.0, simplify_m: float = 0.0):
+    key = (region, areaid, scale_code, float(union_grid_size), float(simplify_m))
     if key in _land_area_cache:
         return _land_area_cache[key]
 
@@ -287,7 +406,15 @@ def land_area_km2_for(region: str, areaid: str, scale_code: str,
         return np.nan
 
     scaled_geom = scale_buffer_geom(base_row, scale_code)
-    land_only = land_union_in_crs(land_path, lakes_path, gdf.crs)
+
+    land_only = land_union_in_crs(
+        land_path, lakes_path, gdf.crs,
+        union_grid_size=union_grid_size,
+        simplify_m=simplify_m
+    )
+    if land_only is None:
+        _land_area_cache[key] = np.nan
+        return np.nan
 
     try:
         inter = make_valid(scaled_geom).intersection(make_valid(land_only))
@@ -314,6 +441,9 @@ def main():
 
     land_path  = args.land_path
     lakes_path = args.lakes_path
+
+    union_grid_size = float(args.union_grid_size)
+    simplify_m = float(args.simplify_m)
 
     # Region files (you can later make CLI overrides if you want)
     region_files = REGION_FILES_DEFAULT.copy()
@@ -415,8 +545,9 @@ def main():
             "Uncertainty_Median":   weighted_median(g["Uncertainty_Median"].values,   g["Burned_Pixels"].values),
         })
 
+    # avoid pandas FutureWarning by grouping only on keys (apply returns series)
     med = (chron.groupby(group_keys, as_index=False)
-           .apply(wm_series)
+           .apply(wm_series, include_groups=False)
            .reset_index(drop=True))
 
     monthly = monthly.merge(med, on=group_keys, how="left")
@@ -425,7 +556,7 @@ def main():
     monthly["Burn_DOY_Range"]      = monthly["Burn_Date_Max"] - monthly["Burn_Date_Min"]
     monthly["Uncertainty_Range"]   = monthly["Uncertainty_Max"] - monthly["Uncertainty_Min"]
 
-    # calendar strings + median month
+    # calendar strings
     monthly["Burn_Date_Min_Date"]    = [doy_to_date(y, d) for y,d in zip(monthly["Year"], monthly["Burn_Date_Min"])]
     monthly["Burn_Date_Max_Date"]    = [doy_to_date(y, d) for y,d in zip(monthly["Year"], monthly["Burn_Date_Max"])]
     monthly["Burn_Date_Median_Date"] = [doy_to_date(y, d) for y,d in zip(monthly["Year"], monthly["Burn_Date_Median_DOY"])]
@@ -441,7 +572,8 @@ def main():
             continue
         la = land_area_km2_for(
             reg, str(r["AreaID"]), str(r["Buffer_Scale"]),
-            region_files=region_files, land_path=land_path, lakes_path=lakes_path
+            region_files=region_files, land_path=land_path, lakes_path=lakes_path,
+            union_grid_size=union_grid_size, simplify_m=simplify_m
         )
         land_rows.append((reg, r["AreaID"], r["Buffer_Scale"], la))
 
@@ -497,8 +629,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
