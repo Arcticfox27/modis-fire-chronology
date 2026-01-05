@@ -10,7 +10,9 @@ across North America, Europe and Russia from 2001 to 2025.
 ## Structure
 
 - `scripts/extract_mcd64a1.py` — Extract per-buffer fire chronology CSVs from MODIS MCD64A1 HDF tiles  
-- `scripts/aggregate_fire_chronology.py` — Aggregate per-buffer CSVs into yearly master tables  
+- `scripts/aggregate_fire_chronology.py` — Aggregate per-buffer CSVs into yearly master tables
+-  `scripts/download_laads_mcd64a1.sh` — Download MODIS MCD64A1 burned area products
+-  `scripts/download_laads_mcd64a1.sh` — Rename the folders to make viable for extraction and aggregation 
 
 ## Required external data
 
