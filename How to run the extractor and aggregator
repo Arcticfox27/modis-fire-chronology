@@ -1,92 +1,241 @@
-# MODIS Fire Chronology — Run Card
+MODIS Fire Chronology – Download and Run Instructions
 
-This card shows the exact commands needed to run the pipeline from the command line.
+This file documents how to:
 
----
+Download MODIS MCD64A1 (Collection 61) data from NASA LAADS DAAC
 
-## 0. Activate environment
+Rename the downloaded folders into the format expected by the pipeline
 
-### Conda (recommended)
+Run the existing extraction and aggregation scripts
 
-conda activate mcd64a1
+The pipeline is intentionally split into:
 
-Verify GDAL has HDF4 support:
+Download
+
+Rename
+
+Extraction
+
+Aggregation
+
+Do NOT merge these steps.
+
+REQUIREMENTS
+
+Operating system:
+
+Linux / WSL / macOS recommended for downloading
+
+Windows supported for extraction and aggregation
+
+Required tools:
+
+curl
+
+python 3.9+
+
+GDAL with HDF4 support
+
+Conda environment used by the extractor (mcd64a1)
+
+Verify GDAL supports HDF4:
 
 gdalinfo --formats | grep HDF
 
-1. Go to repository root
-cd path/to/modis-fire-chronology
+AUTHENTICATION (EARTHDATA / LAADS)
 
-(You must be in the repo root so scripts/ is found.)
+MODIS data is hosted on LAADS DAAC and requires an Earthdata token.
 
-2. Run extraction (per-buffer CSVs)
-Example: run year 2020 (all regions, all months found on disk)
-Windows
-python scripts\extract_mcd64a1.py --years 2020
+Steps:
 
-Linux / macOS
-python scripts/extract_mcd64a1.py --years 2020
+Log in to https://urs.earthdata.nasa.gov
 
-Optional flags
---years        2020 2021 2022
---months       03.01 04.01 05.01 06.01 07.01 08.01 09.01 10.01
---regions      Europe Siberia NorthAmerica
---hdf-root     <path to MODIS HDF root>
---out-root     <path to output_csvs>
+Create an application token
 
-Example: explicit regions
-python scripts/extract_mcd64a1.py \
-  --years 2020 \
-  --regions Europe Siberia NorthAmerica
+Copy the token string
 
-3. Run aggregation (yearly master tables)
-Example: aggregate year 2020
-Windows
-python scripts\aggregate_fire_chronology.py --years 2020
+Export the token (required):
 
-Linux / macOS
-python scripts/aggregate_fire_chronology.py --years 2020
+export LAADS_TOKEN="eyJ0eXAiOiJKV1QiLCJhbGciOi..."
 
-Optional aggregation filters
---years   2020 2021
---months  3 4 5 6 7 8 9 10
+Verify it is visible:
 
-4. Outputs
-After extraction
+echo "$LAADS_TOKEN" | cut -c1-20
 
-Per-buffer CSVs written under:
+DOWNLOAD MODIS MCD64A1 DATA
 
-<OUTPUT_ROOT>/<year>/<year>.<month>/<region>/A<BufferSize>/<scale>/*.csv
+The LAADS archive uses DOY (day-of-year) directories.
+This script downloads month-start DOY folders only, matching MODIS monthly products.
 
-After aggregation
+Script:
+scripts/download_laads_mcd64a1.sh
 
-One CSV per year written to:
+Usage:
 
-<OUTPUT_ROOT>/summaries/buffer_monthly_<YEAR>_master.csv
-
+bash scripts/download_laads_mcd64a1.sh <YEAR> <DEST_ROOT>
 
 Example:
 
-buffer_monthly_2020_master.csv
+bash scripts/download_laads_mcd64a1.sh 2025 /mnt/a/Project_BFA/hdf_files
 
-5. Expected console behavior
+What the script does:
 
-Tiles with no burned pixels → skipped
+Queries LAADS JSON listings
 
-Buffers not intersecting a tile → skipped
+Downloads all .hdf tiles for each month-start DOY
 
-Re-running the same year overwrites outputs
+Skips files that already exist
 
-No severity, no attribution, no modeling — chronology only
+Continues if a single tile fails
 
-6. Stop conditions (by design)
+Safe to re-run
 
-The pipeline stops at:
+Resulting structure:
 
-Burned area chronology
+<DEST_ROOT>/<YEAR>/<YEAR>.<DOY>/*.hdf
 
-Temporal ranges and medians
+Example:
 
-Land-only normalization (% land burned)
+hdf_files/
+2025/
+2025.001/
+2025.032/
+2025.060/
+...
 
-No ecological or causal interpretation is performed.
+RENAME DOY FOLDERS TO CALENDAR MONTHS
+
+The extractor expects calendar month folders.
+
+Script:
+scripts/rename_laads_doy_to_month.sh
+
+Usage:
+
+bash scripts/rename_laads_doy_to_month.sh <YEAR> <DEST_ROOT>
+
+Example:
+
+bash scripts/rename_laads_doy_to_month.sh 2025 /mnt/a/Project_BFA/hdf_files
+
+DOY to month mapping:
+
+001 -> 01
+032 -> 02
+060 -> 03
+091 -> 04
+121 -> 05
+152 -> 06
+182 -> 07
+213 -> 08
+244 -> 09
+274 -> 10
+305 -> 11
+335 -> 12
+
+Resulting structure:
+
+hdf_files/
+2025/
+2025.03.01/
+2025.04.01/
+2025.05.01/
+...
+
+This step only renames folders.
+No files are copied.
+Safe to re-run.
+
+ACTIVATE PROCESSING ENVIRONMENT
+
+Activate the conda environment:
+
+conda activate mcd64a1
+
+RUN EXTRACTION (PER-BUFFER CSVs)
+
+Move to repository root:
+
+cd path/to/modis-fire-chronology
+
+Linux / macOS:
+
+python scripts/extract_mcd64a1.py --years 2025
+
+Windows:
+
+python scripts\extract_mcd64a1.py --years 2025
+
+Optional flags:
+
+--years 2020 2021 2022
+--months 03.01 04.01 05.01 06.01 07.01 08.01 09.01 10.01
+--regions Europe Siberia NorthAmerica
+--hdf-root <path to HDF root>
+--out-root <path to output_csvs>
+
+RUN AGGREGATION (YEARLY MASTER TABLES)
+
+Linux / macOS:
+
+python scripts/aggregate_fire_chronology.py --years 2025
+
+Windows:
+
+python scripts\aggregate_fire_chronology.py --years 2025
+
+Optional filters:
+
+--years 2020 2021
+--months 3 4 5 6 7 8 9 10
+
+OUTPUTS
+
+After extraction:
+
+<OUTPUT_ROOT>/<YEAR>/<YEAR>.<MONTH>/<REGION>/A<BufferSize>/<scale>/*.csv
+
+After aggregation:
+
+<OUTPUT_ROOT>/summaries/buffer_monthly_<YEAR>_master.csv
+
+Example:
+
+buffer_monthly_2025_master.csv
+
+DESIGN NOTES
+
+Outputs are year-wise by design
+
+No upstream combination is performed
+
+Chronology only:
+
+burned area
+
+temporal ranges
+
+medians
+
+land-normalized percentages
+
+No severity modeling
+
+No ecological attribution
+
+No causal interpretation
+
+Downstream users may concatenate yearly CSVs if needed.
+The pipeline intentionally stops here.
+
+SAFE RE-RUNS
+
+Download script: idempotent
+
+Rename script: idempotent
+
+Extraction: overwrites year outputs
+
+Aggregation: overwrites yearly summaries
+
+No hidden state is preserved between runs.
