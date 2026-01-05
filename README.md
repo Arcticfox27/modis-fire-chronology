@@ -27,9 +27,6 @@ This repository contains **code only**. The following datasets must be provided 
   - `ne_10m_land.shp`  
   - `ne_10m_lakes.shp`
 
-- **MODIS tile grid shapefile**  
-  Used for tile identification and quality control.
-
 ## Configuration
 
 All input and output paths are defined directly inside the scripts.
